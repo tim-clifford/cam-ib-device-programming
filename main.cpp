@@ -42,7 +42,7 @@
 #endif
 
 #ifndef A_DECENT_COMPILER
-	// Slight difference here between modern GCC and the online compiler
+// Slight difference here between modern GCC and the online compiler
 Serial pc(SERIAL_TX, SERIAL_RX);
 #define printf pc.printf
 #endif
@@ -72,6 +72,7 @@ char data_read[3];
 // we expect them to loop continuously
 // See CircularArray.cpp for the implementation
 CircularArray<float> temp_data;
+
 // Bitwise state of the LEDs
 CircularArray<char> led_pattern = {
 	0x7, 0x0, 0x7, 0x0, 0x7,    // S
@@ -93,7 +94,7 @@ float led_pattern_interval = 0.1;
 void set_led(char mask)
 {
 	// doing this the way it is in the
-	// examples is pretty disgusting tbh
+	// examples is pretty ugly tbh
 	led1 =  mask     & 1;
 	led2 = (mask>>1) & 1;
 	led3 = (mask>>2) & 1;
@@ -230,6 +231,7 @@ int main()
 	lm75_int.rise(&on_under_temp);
 
 	cycle_ticker.attach(on_cycle_tick, DATA_RATE);
+
 #ifdef DEBUG
 	printf("End of main()" endl);
 #endif

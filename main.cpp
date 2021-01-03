@@ -1,162 +1,236 @@
+// only small brains use other editors
+/* vim: set ts=4 sw=4 tw=0 noet :*/
+// tab gang
+
 #include "mbed.h"
-#define DEBUG
+#include "stdint.h"				//This allow the use of integers of a known width
+#include "CircularArray.cpp"	// circular array for storing the data
+
+#define LM75_REG_TEMP  (0x00)	// Temperature Register
+#define LM75_REG_CONF  (0x01)	// Configuration Register
+#define LM75_ADDR      (0x90)	// LM75 address
+#define LM75_REG_TOS   (0x03)	// TOS Register
+#define LM75_REG_THYST (0x02)	// THYST Register
+
+#define T_DEFAULT      -273.15
+#define F_EPSILON       0.001	// acceptable floating point error
+#define N_DATA          60		// number of datapoints to take
+
+// The online compiler doesn't support chrono types
+// and other cool stuff,
+// but i'm using GCC_ARM 10 and:
+//   a) i don't like warning messages
+//   b) I'm not going to use deprecated functions
+//      just to support a compiler that was outdated
+//      in 2008!!
+#ifdef __GNUC__
+#	if __GNUC__ >= 10
+#		define A_DECENT_COMPILER
+#	endif
+#endif
+
+#ifdef A_DECENT_COMPILER
+#	define DATA_RATE    1s		// time between data captures
+#else
+#	define DATA_RATE    1
+#endif
+
+#ifdef A_DECENT_COMPILER
+#	define endl "\n"			// can you tell I'm a linux user?
+#else
+#	define endl "\r\n"
+#endif
+
+#ifndef A_DECENT_COMPILER
+	// Slight difference here between modern GCC and the online compiler
+Serial pc(SERIAL_TX, SERIAL_RX);
+#define printf pc.printf
+#endif
+
+#define TOS             28		// TOS temperature
+#define THYST           26		// THYST tempertuare
+
+//#define DEBUG
+
+EventQueue *queue;				// For long ISRs
+
+I2C i2c(I2C_SDA, I2C_SCL);
 
 DigitalOut led1(LED1);			// Green LED
 DigitalOut led2(LED2);			// Blue LED
 DigitalOut led3(LED3);			// Red LED
-InterruptIn button(USER_BUTTON);
 
-// For long ISRs
-EventQueue *queue;
-
-Timeout button_debounce_timeout;
-float debounce_time_interval = 0.1;
+InterruptIn lm75_int(D7);		// TOS interrupt pin
 
 Ticker cycle_ticker;
-float cycle_time_interval = 1;
+Ticker alarm_ticker;
 
-int led_show_index;
-int led_values_n = 3;
-int led_values[3] = { 1, 2, 3 };
+char data_write[3];
+char data_read[3];
 
-// Basic linked list for the user sequence
-typedef struct node_struct {
-	int value;
-	struct node_struct *next;
-} node;
+// circular arrays make sense here since
+// we expect them to loop continuously
+// See CircularArray.cpp for the implementation
+CircularArray<float> temp_data;
+// Bitwise state of the LEDs
+CircularArray<char> led_pattern = {
+	0x7, 0x0, 0x7, 0x0, 0x7,    // S
+	0x0, 0x0, 0x0,              // _
+	0x7, 0x7, 0x7, 0x0, 0x7, 0x7, 0x7,
+	0x0, 0x7, 0x7, 0x7,         // 0
+	0x0, 0x0, 0x0,              // _
+	0x7, 0x0, 0x7, 0x0, 0x7,    // S
+	0x0, 0x0, 0x0,              // _
+	0x0, 0x0, 0x0, 0x0,         // _
+};
 
-node *first_sequence_node;
-node *current_sequence_node;
-
-// I am going to interpret a "double click" as two clicks without
-// any change of LED color
-bool double_click_available = false;
-
-void onButtonStopDebouncing();
-void onButtonPress();
-void addToSequence(int led_show_index_i);
-void onCycleTick();
-void onCycleTickUser();
-void start_user_sequence();
-void select_led(int l);
-void next_led_sequence();
-int main();
-
-void select_led(int l)
-{
-	if (l > 3 || l < 0)
-		return;
-	led1 = l == 1;
-	led2 = l == 2;
-	led3 = l == 3;
-}
-
-void onButtonStopDebouncing();
-
-void addToSequence(int led_show_index_i)
-{
-	// This is too slow for the ISR
-	if (current_sequence_node->value != -1) {
-		node *new_node = (node *) malloc(sizeof(node));
-		if (new_node == NULL)
-			exit(1);
-		current_sequence_node->next = new_node;
-		current_sequence_node = new_node;
-	}
-	current_sequence_node->value = led_show_index_i;
-	current_sequence_node->next = NULL;
-
-#ifdef DEBUG
-	printf("Current contents of linked list");
-	node *temp_ptr = first_sequence_node;
-	while (temp_ptr->next != NULL) {
-		printf(" %d", temp_ptr->value);
-		temp_ptr = temp_ptr->next;
-	}
-	printf(" %d\n", temp_ptr->value);
+#ifdef A_DECENT_COMPILER
+auto led_pattern_interval = 100ms;
+#else
+float led_pattern_interval = 0.1;
 #endif
 
+void set_led(char mask)
+{
+	// doing this the way it is in the
+	// examples is pretty disgusting tbh
+	led1 =  mask     & 1;
+	led2 = (mask>>1) & 1;
+	led3 = (mask>>2) & 1;
 }
 
-void onButtonPress()
+void setup_registers(float tos, float thyst)
 {
-	if (double_click_available) {
-		// disable the button until a reset
-		button.rise(NULL);
-		// There has been a second click without any
-		// change of LED color, so start the new sequence
-		queue->call(&start_user_sequence);
-	} else {
-		double_click_available = true;
-		queue->call(&addToSequence, led_show_index);
-		button.rise(NULL);
-		button_debounce_timeout.attach(onButtonStopDebouncing,
-									   debounce_time_interval);
-	}
-}
-
-void onButtonStopDebouncing()
-{
-	button.rise(onButtonPress);
-}
-
-void onCycleTick()
-{
-	led_show_index = (led_show_index + 1) % led_values_n;
-	select_led(led_values[led_show_index]);
-	double_click_available = false;
-}
-
-void next_led_sequence()
-{
-	select_led(led_values[current_sequence_node->value]);
-	current_sequence_node = current_sequence_node->next;
-}
-
-void onCycleTickUser()
-{
-	queue->call(&next_led_sequence);
-}
-
-void start_user_sequence()
-{
-	// make the linked list circular
-	// since a double click initiated the sequence,
-	// we also have to remove the last value
-	current_sequence_node = first_sequence_node;
-	if (current_sequence_node->next == NULL) {
-		// there is no sequence, fail by doing nothing
-		first_sequence_node->value = -1;
-		first_sequence_node->next = NULL;
-		button.rise(onButtonPress);
-		return;
-	}
-	while (current_sequence_node->next->next != NULL)
-		current_sequence_node = current_sequence_node->next;
-	current_sequence_node->next = first_sequence_node;
-
-	// reset to the start of the sequence and replace cycle ticker
-	current_sequence_node = first_sequence_node;
-#ifdef DEBUG
-	printf("Starting new sequence\n");
+	/* Configure the Temperature sensor device STLM75:
+	   - Comparator mode
+	   - Fault tolerance: 0
+	   - Comparator mode means we can keep reading temperature data
+	   and use the OS pin as an interrupt to control the alarm
+	   - Another approach would be to stop reading temperature data
+	   until the rising edge of the OS pin, but I'd rather take more data
+	 */
+	data_write[0] = LM75_REG_CONF;
+	data_write[1] = 0x00;
+	int status = i2c.write(LM75_ADDR, data_write, 2, 0);
+	if (status != 0) {            // Error
+		while (1) {
+			led1 = !led1;
+#ifdef a_DECENT_COMPILER
+			ThisThread::sleep_for(200ms);
+#else
+			// here's another reason chrono types are way better:
+			// ThisThread::sleep_for uses milliseconds while the
+			// tickers use seconds!
+			ThisThread::sleep_for(200);
 #endif
+		}
+	}
+
+	// Set the TOS register
+	data_write[0] = LM75_REG_TOS;
+	int16_t i16 = (int16_t) (tos * 256) & 0xFF80;
+	data_write[1] = (i16 >> 8) & 0xff;
+	data_write[2] = i16 & 0xff;
+	i2c.write(LM75_ADDR, data_write, 3, 0);
+
+	// Set the THYST register
+	data_write[0] = LM75_REG_THYST;
+	i16 = (int16_t) (thyst * 256) & 0xFF80;
+	data_write[1] = (i16 >> 8) & 0xff;
+	data_write[2] = i16 & 0xff;
+	i2c.write(LM75_ADDR, data_write, 3, 0);
+}
+
+void add_temp()
+{
+	// Read temperature register
+	data_write[0] = LM75_REG_TEMP;
+	i2c.write(LM75_ADDR, data_write, 1, 1);    // no stop
+	i2c.read(LM75_ADDR, data_read, 2, 0);
+
+	// Calculate temperature value in Celcius
+	int16_t i16 = (data_read[0] << 8) | data_read[1];
+	// Read data as twos complement integer so sign is correct
+	temp_data.add(i16 / 256.0);
+#ifdef DEBUG
+	printf("Adding temperature: %f" endl, i16 / 256.0);
+#endif
+}
+
+void on_cycle_tick()
+{
+	queue->call(add_temp);
+}
+
+void next_alarm_state()
+{
+	set_led(led_pattern++);
+}
+
+void print_all_temp()
+{
+	// stop writing to the array while we read from it
 	cycle_ticker.detach();
-	cycle_ticker.attach(onCycleTickUser, cycle_time_interval);
+	printf("========BEGIN TEMPERATURE DUMP========" endl);
+	for (int i = 0; i < N_DATA; i++) {
+		// print value only if it is has been set
+		// the current position in the circular array is
+		// the last taken temperature, so we start from
+		// the next one - which is the oldest.
+		if (abs(T_DEFAULT - ++temp_data) > F_EPSILON) {
+			printf("%.3f" endl, *temp_data);
+		}
+		// at the end of this printing the circular array
+		// has looped back to the original position
+	}
+	printf("=========END TEMPERATURE DUMP=========" endl);
+	cycle_ticker.attach(on_cycle_tick, DATA_RATE);
+}
+
+void on_over_temp()
+{
+	alarm_ticker.attach(next_alarm_state, led_pattern_interval);
+	queue->call(print_all_temp);
+}
+
+void on_under_temp()
+{
+	alarm_ticker.detach();
+	set_led(0);
 }
 
 int main()
 {
-	printf("Program start\n");
+#ifdef DEBUG
+	printf("Program start" endl);
+#	ifdef __GNUC__
+#		ifdef __GNUC_MINOR__
+	printf("GCC_VERSION: %d.%d" endl, __GNUC__, __GNUC_MINOR__);
+#		else
+	printf("GCC_VERSION: %d.x" endl, __GNUC__);
+#		endif
+#	endif
+#endif
+
+#ifndef A_DECENT_COMPILER
+	// This is set by a config file in the mbed-cli setup
+	pc.baud(9600);
+#endif
+
+	temp_data = CircularArray<float>(N_DATA, T_DEFAULT);
+
+	setup_registers(TOS, THYST);
+
 	queue = mbed_event_queue();
-	led_show_index = -1;
 
-	first_sequence_node = (node *) malloc(sizeof(node));
-	if (first_sequence_node == NULL)
-		return 1;
-	first_sequence_node->value = -1;	// initialize to nonsensical value
-	first_sequence_node->next = NULL;
-	current_sequence_node = first_sequence_node;
+	// The interrupt line is active low so we trigger on a falling edge
+	lm75_int.fall(&on_over_temp);
 
-	cycle_ticker.attach(onCycleTick, cycle_time_interval);
-	button.rise(onButtonPress);
+	// Stop the alarm if the temperature returns to normal
+	lm75_int.rise(&on_under_temp);
+
+	cycle_ticker.attach(on_cycle_tick, DATA_RATE);
+#ifdef DEBUG
+	printf("End of main()" endl);
+#endif
 }

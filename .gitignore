@@ -1,6 +1,5 @@
 .build
 .mbed
-*.py*
 *~
 mnt
 __pycache__
